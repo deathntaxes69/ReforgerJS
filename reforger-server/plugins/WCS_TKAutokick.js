@@ -1,3 +1,4 @@
+// ReforgerJS/reforger-server/plugins/WCS_TKAutokick.js
 const mysql = require("mysql2/promise");
 
 class WCS_TKAutokick {
@@ -6,6 +7,7 @@ class WCS_TKAutokick {
     this.name = "WCS_TKAutokick Plugin";
     this.isInitialized = false;
     this.serverInstance = null;
+    this.serverId = null; // To store the server ID
     
     this.teamkillLimit = 5;
     this.timeWindowMinutes = 20;
@@ -20,11 +22,18 @@ class WCS_TKAutokick {
   async prepareToMount(serverInstance) {
     await this.cleanup();
     this.serverInstance = serverInstance;
+    // Get the server ID from the instance's scoped config
+    this.serverId = this.serverInstance.config.server.id || null;
 
     try {
       const pluginConfig = this.config.plugins.find(plugin => plugin.plugin === "WCS_TKAutokick");
       if (!pluginConfig || !pluginConfig.enabled) {
-        logger.verbose(`[${this.name}] Plugin is disabled in configuration.`);
+        logger.verbose(`[${this.name}] Plugin is disabled in configuration for Server ${this.serverId || '?'}.`);
+        return;
+      }
+      
+      if (!this.serverId) {
+        logger.error(`[${this.name}] Server ID is missing. Plugin will be disabled.`);
         return;
       }
 
@@ -41,7 +50,7 @@ class WCS_TKAutokick {
       }
 
       if (!this.serverInstance.rcon) {
-        logger.error(`[${this.name}] RCON is not available. Plugin will be disabled.`);
+        logger.error(`[${this.name}] [Server ${this.serverId}] RCON is not available. Plugin will be disabled.`);
         return;
       }
 
@@ -49,18 +58,24 @@ class WCS_TKAutokick {
       this.startCleanup();
 
       this.isInitialized = true;
-      logger.info(`[${this.name}] Initialized successfully. Monitoring for friendly fire (${this.teamkillLimit} teamkills in ${this.timeWindowMinutes} minutes = auto-kick).`);
-      logger.info(`[${this.name}] Warning message: "${this.warningMessage}"`);
+      logger.info(`[${this.name}] [Server ${this.serverId}] Initialized successfully. Monitoring for friendly fire (${this.teamkillLimit} teamkills in ${this.timeWindowMinutes} minutes = auto-kick).`);
+      logger.info(`[${this.name}] [Server ${this.serverId}] Warning message: "${this.warningMessage}"`);
     } catch (error) {
-      logger.error(`[${this.name}] Error during initialization: ${error.message}`);
+      logger.error(`[${this.name}] [Server ${this.serverId}] Error during initialization: ${error.message}`);
     }
   }
 
   setupEventListeners() {
+    // This listener is on the serverInstance, so it's already scoped to this server
     this.serverInstance.on('playerKilledEvent', this.handlePlayerKilled.bind(this));
   }
 
   async handlePlayerKilled(data) {
+    // Check if the event is from the correct server
+    if (data.serverId !== this.serverId) {
+      return;
+    }
+    
     if (!data || !data.killer || !data.victim || !data.kill) {
       return;
     }
@@ -70,7 +85,7 @@ class WCS_TKAutokick {
     }
 
     if (!data.kill.weapon || data.kill.weapon === 'unknown') {
-      logger.verbose(`[${this.name}] Ignoring friendly fire with unknown weapon by ${data.killer.name}`);
+      logger.verbose(`[${this.name}] [Server ${this.serverId}] Ignoring friendly fire with unknown weapon by ${data.killer.name}`);
       return;
     }
 
@@ -85,7 +100,7 @@ class WCS_TKAutokick {
     const weapon = data.kill.weapon;
     const currentTime = Date.now();
 
-    logger.info(`[${this.name}] Friendly fire detected: ${killerName} (ID: ${killerId}) killed ${victimName} with ${weapon}`);
+    logger.info(`[${this.name}] [Server ${this.serverId}] Friendly fire detected: ${killerName} (ID: ${killerId}) killed ${victimName} with ${weapon}`);
 
     if (!this.teamkillTracker.has(killerGUID)) {
       this.teamkillTracker.set(killerGUID, []);
@@ -108,26 +123,26 @@ class WCS_TKAutokick {
       await this.warnPlayer(killerId, killerName, recentTeamkills.length);
       
       const remaining = this.teamkillLimit - recentTeamkills.length;
-      logger.warn(`[${this.name}] ${killerName} (ID: ${killerId}) has ${recentTeamkills.length} friendly fire incidents in the last ${this.timeWindowMinutes} minutes. ${remaining} more will result in auto-kick.`);
+      logger.warn(`[${this.name}] [Server ${this.serverId}] ${killerName} (ID: ${killerId}) has ${recentTeamkills.length} friendly fire incidents in the last ${this.timeWindowMinutes} minutes. ${remaining} more will result in auto-kick.`);
     }
   }
 
   async warnPlayer(killerId, killerName, currentCount) {
     try {
       if (!this.serverInstance.rcon || !this.serverInstance.rcon.isConnected) {
-        logger.error(`[${this.name}] Cannot warn ${killerName} - RCON is not connected.`);
+        logger.error(`[${this.name}] [Server ${this.serverId}] Cannot warn ${killerName} - RCON is not connected.`);
         return;
       }
 
       const warnCommand = `#warn ${killerId} "${this.warningMessage}"`;
       
-      logger.info(`[${this.name}] WARNING: Sending teamkill warning to ${killerName} (${currentCount}/${this.teamkillLimit}). Command: ${warnCommand}`);
+      logger.info(`[${this.name}] [Server ${this.serverId}] WARNING: Sending teamkill warning to ${killerName} (${currentCount}/${this.teamkillLimit}). Command: ${warnCommand}`);
 
       this.serverInstance.rcon.sendCustomCommand(warnCommand);
 
-      logger.info(`[${this.name}] Successfully warned ${killerName} for friendly fire.`);
+      logger.info(`[${this.name}] [Server ${this.serverId}] Successfully warned ${killerName} for friendly fire.`);
     } catch (error) {
-      logger.error(`[${this.name}] Error warning player ${killerName}: ${error.message}`);
+      logger.error(`[${this.name}] [Server ${this.serverId}] Error warning player ${killerName}: ${error.message}`);
     }
   }
 
@@ -151,27 +166,27 @@ class WCS_TKAutokick {
   async kickPlayer(killerGUID, killerId, killerName, teamkills) {
     try {
       if (!this.serverInstance.rcon || !this.serverInstance.rcon.isConnected) {
-        logger.error(`[${this.name}] Cannot kick ${killerName} - RCON is not connected.`);
+        logger.error(`[${this.name}] [Server ${this.serverId}] Cannot kick ${killerName} - RCON is not connected.`);
         return;
       }
 
       const kickCommand = `#kick ${killerId}`;
       
-      logger.warn(`[${this.name}] AUTO-KICK: ${killerName} (ID: ${killerId}, GUID: ${killerGUID}) exceeded friendly fire limit (${teamkills.length}/${this.teamkillLimit}). Executing: ${kickCommand}`);
+      logger.warn(`[${this.name}] [Server ${this.serverId}] AUTO-KICK: ${killerName} (ID: ${killerId}, GUID: ${killerGUID}) exceeded friendly fire limit (${teamkills.length}/${this.teamkillLimit}). Executing: ${kickCommand}`);
 
-      logger.info(`[${this.name}] Friendly fire history for ${killerName}:`);
+      logger.info(`[${this.name}] [Server ${this.serverId}] Friendly fire history for ${killerName}:`);
       teamkills.forEach((tk, index) => {
         const timeAgo = Math.round((Date.now() - tk.timestamp) / 60000);
-        logger.info(`[${this.name}]   ${index + 1}. Killed ${tk.victimName} with ${tk.weapon} (${timeAgo} minutes ago)`);
+        logger.info(`[${this.name}] [Server ${this.serverId}]   ${index + 1}. Killed ${tk.victimName} with ${tk.weapon} (${timeAgo} minutes ago)`);
       });
 
       this.serverInstance.rcon.sendCustomCommand(kickCommand);
 
       this.teamkillTracker.delete(killerGUID);
 
-      logger.warn(`[${this.name}] Successfully kicked ${killerName} (ID: ${killerId}) for excessive friendly fire.`);
+      logger.warn(`[${this.name}] [Server ${this.serverId}] Successfully kicked ${killerName} (ID: ${killerId}) for excessive friendly fire.`);
     } catch (error) {
-      logger.error(`[${this.name}] Error kicking player ${killerName}: ${error.message}`);
+      logger.error(`[${this.name}] [Server ${this.serverId}] Error kicking player ${killerName}: ${error.message}`);
     }
   }
 
@@ -199,7 +214,7 @@ class WCS_TKAutokick {
     }
 
     if (cleanedPlayers > 0) {
-      logger.verbose(`[${this.name}] Cleaned up friendly fire history for ${cleanedPlayers} players.`);
+      logger.verbose(`[${this.name}] [Server ${this.serverId}] Cleaned up friendly fire history for ${cleanedPlayers} players.`);
     }
   }
 
@@ -216,7 +231,7 @@ class WCS_TKAutokick {
 
     this.teamkillTracker.clear();
     this.isInitialized = false;
-    logger.verbose(`[${this.name}] Cleanup completed.`);
+    logger.verbose(`[${this.name}] Cleanup completed for Server ${this.serverId || '?'}.`);
   }
 }
 
