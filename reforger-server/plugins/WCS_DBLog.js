@@ -1,3 +1,4 @@
+// ReforgerJS/reforger-server/plugins/WCS_DBLog.js
 const mysql = require("mysql2/promise");
 
 class WCS_DBLog {
@@ -6,6 +7,7 @@ class WCS_DBLog {
     this.name = "WCS_DBLog Plugin";
     this.isInitialized = false;
     this.serverInstance = null;
+    this.serverId = null; // To store the server ID
     this.playerCache = new Map();
     this.cacheTTL = 10 * 60 * 1000;
   }
@@ -13,6 +15,8 @@ class WCS_DBLog {
   async prepareToMount(serverInstance) {
     await this.cleanup();
     this.serverInstance = serverInstance;
+    // Get the server ID from the instance's scoped config
+    this.serverId = this.serverInstance.config.server.id || null; 
 
     try {
       if (
@@ -20,7 +24,7 @@ class WCS_DBLog {
         !this.config.connectors.mysql ||
         !this.config.connectors.mysql.enabled
       ) {
-        logger.warn(`[${this.name}] MySQL is not enabled in the configuration. Plugin will be disabled.`);
+        logger.warn(`[${this.name}] MySQL is not enabled in the configuration. Plugin will be disabled for Server ${this.serverId || '?'}.`);
         return;
       }
 
@@ -28,21 +32,26 @@ class WCS_DBLog {
         logger.error(`[${this.name}] MySQL pool is not available. Ensure MySQL is connected before enabling this plugin.`);
         return;
       }
+      
+      if (!this.serverId) {
+        logger.error(`[${this.name}] Server ID is missing. Plugin will be disabled.`);
+        return;
+      }
 
       const dbLogPlugin = this.config.plugins.find(plugin => plugin.plugin === "DBLog");
       if (!dbLogPlugin || !dbLogPlugin.enabled) {
-        logger.error(`[${this.name}] DBLog plugin must be enabled for WCS_DBLog to work. Plugin will be disabled.`);
+        logger.error(`[${this.name}] DBLog plugin must be enabled for WCS_DBLog to work. Plugin will be disabled for Server ${this.serverId}.`);
         return;
       }
 
       const pluginConfig = this.config.plugins.find(plugin => plugin.plugin === "WCS_DBLog");
       if (!pluginConfig || !pluginConfig.enabled) {
-        logger.verbose(`[${this.name}] Plugin is disabled in configuration.`);
+        logger.verbose(`[${this.name}] Plugin is disabled in configuration for Server ${this.serverId}.`);
         return;
       }
 
       if (!(await this.checkPlayersTable())) {
-        logger.error(`[${this.name}] Players table not found. DBLog plugin must run first to create the table. Plugin will be disabled.`);
+        logger.error(`[${this.name}] 'players' table not found. DBLog plugin must run first to create the table. Plugin will be disabled for Server ${this.serverId}.`);
         return;
       }
 
@@ -51,9 +60,9 @@ class WCS_DBLog {
       this.setupEventListeners();
 
       this.isInitialized = true;
-      logger.info(`[${this.name}] Initialized successfully and listening for WCS events.`);
+      logger.info(`[${this.name}] Initialized successfully for Server ${this.serverId} and listening for WCS events.`);
     } catch (error) {
-      logger.error(`[${this.name}] Error during initialization: ${error.message}`);
+      logger.error(`[${this.name}] Error during initialization for Server ${this.serverId}: ${error.message}`);
     }
   }
 
@@ -64,7 +73,7 @@ class WCS_DBLog {
       connection.release();
       return tables.length > 0;
     } catch (error) {
-      logger.error(`[${this.name}] Error checking for players table: ${error.message}`);
+      logger.error(`[${this.name}] Error checking for 'players' table: ${error.message}`);
       return false;
     }
   }
@@ -96,7 +105,7 @@ class WCS_DBLog {
         await connection.query(alterQuery);
         logger.info(`[${this.name}] Migrated players table with new columns: ${alterQueries.join(', ')}`);
       } else {
-        logger.verbose(`[${this.name}] Players table already has required columns.`);
+        logger.verbose(`[${this.name}] Players table already has WCS columns.`);
       }
 
       connection.release();
@@ -112,9 +121,13 @@ class WCS_DBLog {
 
   async handlePlayerConnected(data) {
     if (!data || !data.playerGUID || !data.playerName) {
-      logger.warn(`[${this.name}] Received incomplete playerConnectedEvent data`);
+      logger.warn(`[${this.name}] Received incomplete playerConnectedEvent data on Server ${this.serverId}`);
       return;
     }
+
+    // This event comes from a custom log parser which should have added the serverId.
+    // But we will trust our instance's serverId more.
+    const currentServerId = this.serverId;
 
     try {
       const playerUID = data.playerGUID;
@@ -122,15 +135,16 @@ class WCS_DBLog {
       const profileName = data.profileName || null;
       const platform = data.platform || null;
 
-      const cacheKey = `${playerUID}_${profileName}_${platform}`;
+      const cacheKey = `${playerUID}_${profileName}_${platform}_${currentServerId}`;
       if (this.playerCache.has(cacheKey)) {
-        logger.verbose(`[${this.name}] Player ${playerName} WCS data already cached, skipping update`);
+        logger.verbose(`[${this.name}] Player ${playerName} WCS data already cached, skipping update on Server ${currentServerId}`);
         return;
       }
 
+      // Query using both playerUID AND serverId
       const [rows] = await process.mysqlPool.query(
-        "SELECT * FROM players WHERE playerUID = ?",
-        [playerUID]
+        "SELECT * FROM players WHERE playerUID = ? AND server_id = ?",
+        [playerUID, currentServerId]
       );
 
       if (rows.length > 0) {
@@ -159,27 +173,34 @@ class WCS_DBLog {
             .join(', ');
           const values = Object.values(updateFields);
           values.push(playerUID);
+          values.push(currentServerId); // Add serverId to the WHERE clause
 
-          const updateQuery = `UPDATE players SET ${setClause} WHERE playerUID = ?`;
+          const updateQuery = `UPDATE players SET ${setClause} WHERE playerUID = ? AND server_id = ?`;
           await process.mysqlPool.query(updateQuery, values);
 
-          logger.info(`[${this.name}] Updated WCS data for player ${playerName} (${playerUID})`);
+          logger.info(`[${this.name}] Updated WCS data for player ${playerName} (${playerUID}) on Server ${currentServerId}`);
         } else {
-          logger.verbose(`[${this.name}] No WCS data update needed for player ${playerName}`);
+          logger.verbose(`[${this.name}] No WCS data update needed for player ${playerName} on Server ${currentServerId}`);
         }
       } else {
+        // This player doesn't have a record in the 'players' table *for this server* yet.
+        // This can happen if the WCS event fires before the DBLog plugin has run.
+        // We will insert a new record.
         const insertQuery = `
-          INSERT INTO players (playerName, playerUID, profileName, platform)
-          VALUES (?, ?, ?, ?)
+          INSERT INTO players (playerName, playerUID, profileName, platform, server_id)
+          VALUES (?, ?, ?, ?, ?)
+          ON DUPLICATE KEY UPDATE 
+          playerName=VALUES(playerName), profileName=VALUES(profileName), platform=VALUES(platform)
         `;
         await process.mysqlPool.query(insertQuery, [
           playerName,
           playerUID,
           profileName,
-          platform
+          platform,
+          currentServerId
         ]);
 
-        logger.info(`[${this.name}] Created new player record for ${playerName} (${playerUID}) with WCS data`);
+        logger.info(`[${this.name}] Created new player record for ${playerName} (${playerUID}) on Server ${currentServerId} with WCS data`);
       }
 
       this.playerCache.set(cacheKey, true);
@@ -188,7 +209,7 @@ class WCS_DBLog {
       }, this.cacheTTL);
 
     } catch (error) {
-      logger.error(`[${this.name}] Error handling playerConnectedEvent for ${data.playerName}: ${error.message}`);
+      logger.error(`[${this.name}] Error handling playerConnectedEvent for ${data.playerName} on Server ${currentServerId}: ${error.message}`);
     }
   }
 
@@ -199,7 +220,7 @@ class WCS_DBLog {
     }
     this.playerCache.clear();
     this.isInitialized = false;
-    logger.verbose(`[${this.name}] Cleanup completed.`);
+    logger.verbose(`[${this.name}] Cleanup completed for Server ${this.serverId || '?'}.`);
   }
 }
 
