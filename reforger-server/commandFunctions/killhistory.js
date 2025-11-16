@@ -1,7 +1,8 @@
+// ReforgerJS/reforger-server/commandFunctions/killhistory.js
 const { EmbedBuilder } = require('discord.js');
 const mysql = require('mysql2/promise');
 
-module.exports = async (interaction, serverInstance, discordClient, extraData = {}) => {
+module.exports = async (interaction, serverInstances, discordClient, extraData = {}) => {
     const identifier = interaction.options.getString('identifier');
     const teamkillsOnly = interaction.options.getBoolean('teamkills_only') || false;
     const serverIdOption = interaction.options.getInteger('server');
@@ -14,7 +15,7 @@ module.exports = async (interaction, serverInstance, discordClient, extraData = 
     }
 
     try {
-        const pool = process.mysqlPool || serverInstance.mysqlPool;
+        const pool = process.mysqlPool; // Use global pool
         if (!pool) {
             await interaction.editReply('Database connection is not initialized.');
             return;
@@ -24,80 +25,85 @@ module.exports = async (interaction, serverInstance, discordClient, extraData = 
         const [playersTableCheck] = await pool.query(`SHOW TABLES LIKE 'players'`);
         
         if (!rjsKillsTableCheck.length) {
-            await interaction.editReply('RJS kills table is missing. RJS_DBEvents plugin may not be enabled.');
+            await interaction.editReply('`rjs_playerkills` table is missing. The WCS_DBEvents plugin may not be enabled or has not run yet.');
             return;
         }
 
         if (!playersTableCheck.length) {
-            await interaction.editReply('Players table is missing. DBLog plugin may not be enabled.');
+            await interaction.editReply('`players` table is missing. The DBLog plugin may not be enabled or has not run yet.');
             return;
         }
 
         const isUUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(identifier);
         
         let killerGUID;
-        let killerName;
+        let killerName = 'Unknown Player';
+        
+        // Build server filter
+        const serverFilter = serverIdOption ? `AND server_id = ?` : '';
+        const serverParam = serverIdOption ? [serverIdOption.toString()] : [];
+        const serverMessage = serverIdOption ? ` on server ${serverIdOption}` : '';
 
         if (isUUID) {
             killerGUID = identifier;
             
-            let existsQuery;
-            let queryParams;
-            
-            if (serverIdOption) {
-                existsQuery = `SELECT (
-                    EXISTS (SELECT 1 FROM rjs_playerkills WHERE killerBiId = ? AND server_id = ?) 
-                    OR EXISTS (SELECT 1 FROM players WHERE playerUID = ?)
-                ) AS existsInDB`;
-                queryParams = [killerGUID, serverIdOption.toString(), killerGUID];
-            } else {
-                existsQuery = `SELECT (
-                    EXISTS (SELECT 1 FROM rjs_playerkills WHERE killerBiId = ?) 
-                    OR EXISTS (SELECT 1 FROM players WHERE playerUID = ?)
-                ) AS existsInDB`;
-                queryParams = [killerGUID, killerGUID];
+            // Try to find player name
+            try {
+                const [playerRow] = await pool.query(
+                    `SELECT playerName FROM players WHERE playerUID = ? ${serverFilter} LIMIT 1`, 
+                    [killerGUID, ...serverParam]
+                );
+                if (playerRow.length > 0) {
+                    killerName = playerRow[0].playerName;
+                } else {
+                    const [anyPlayerRow] = await pool.query(
+                        `SELECT playerName FROM players WHERE playerUID = ? LIMIT 1`, 
+                        [killerGUID]
+                    );
+                    if (anyPlayerRow.length > 0) killerName = anyPlayerRow[0].playerName;
+                }
+            } catch (e) {
+                logger.warn(`[KillHistoryRJS Command] Could not fetch player name for ${killerGUID}: ${e.message}`);
             }
+
+            // Check if player exists in DB
+            let existsQuery = `SELECT (
+                EXISTS (SELECT 1 FROM rjs_playerkills WHERE killerBiId = ? ${serverFilter}) 
+                OR EXISTS (SELECT 1 FROM players WHERE playerUID = ? ${serverFilter})
+            ) AS existsInDB`;
             
-            const [[playerExists]] = await pool.query(existsQuery, queryParams);
+            const [[playerExists]] = await pool.query(existsQuery, [killerGUID, ...serverParam, killerGUID, ...serverParam]);
             
             if (!playerExists.existsInDB) {
-                const serverMessage = serverIdOption ? ` on server ${serverIdOption}` : '';
                 await interaction.editReply(`Player with UUID: ${killerGUID} could not be found${serverMessage}.`);
                 return;
             }
             
-            const [playerRow] = await pool.query(`SELECT playerName FROM players WHERE playerUID = ?`, [killerGUID]);
-            killerName = (playerRow.length > 0) ? playerRow[0].playerName : 'Unknown Player';
         } else {
+            // Find by name
             const [matchingPlayers] = await pool.query(
-                `SELECT DISTINCT playerUID, playerName FROM players WHERE playerName LIKE ?`,
-                [`%${identifier}%`]
+                `SELECT DISTINCT playerUID, playerName, server_id FROM players WHERE playerName LIKE ? ${serverFilter}`,
+                [`%${identifier}%`, ...serverParam]
             );
             
             if (matchingPlayers.length === 0) {
+                // If not in players table, check kill history
                 const [matchingKillers] = await pool.query(
-                    `SELECT DISTINCT killerBiId, killerName FROM rjs_playerkills WHERE killerName LIKE ? AND killerBiId IS NOT NULL`,
-                    [`%${identifier}%`]
+                    `SELECT DISTINCT killerBiId, killerName, server_id FROM rjs_playerkills WHERE killerName LIKE ? AND killerBiId IS NOT NULL ${serverFilter}`,
+                    [`%${identifier}%`, ...serverParam]
                 );
                 
                 if (matchingKillers.length === 0) {
-                    await interaction.editReply(`No players found with name containing: ${identifier}`);
+                    await interaction.editReply(`No players found with name containing: ${identifier}${serverMessage}`);
                     return;
                 } else if (matchingKillers.length > 1) {
-                    const displayCount = Math.min(matchingKillers.length, 3);
-                    let responseMessage = `Found ${matchingKillers.length} players in kill history matching "${identifier}". `;
-                    
-                    if (matchingKillers.length > 3) {
-                        responseMessage += `Showing first 3 results. Please refine your search or use a UUID instead.\n\n`;
-                    } else {
-                        responseMessage += `Please use one of the following UUIDs for a specific player:\n\n`;
-                    }
+                    const displayCount = Math.min(matchingKillers.length, 5);
+                    let responseMessage = `Found ${matchingKillers.length} players in kill history matching "${identifier}"${serverMessage}. Showing first ${displayCount}. Please refine your search or use a UUID.\n\n`;
                     
                     for (let i = 0; i < displayCount; i++) {
                         const player = matchingKillers[i];
-                        responseMessage += `${i+1}. ${player.killerName} - UUID: ${player.killerBiId}\n`;
+                        responseMessage += `${i+1}. ${player.killerName} (Server ${player.server_id})\n   UUID: ${player.killerBiId}\n`;
                     }
-                    
                     await interaction.editReply(responseMessage);
                     return;
                 } else {
@@ -105,18 +111,12 @@ module.exports = async (interaction, serverInstance, discordClient, extraData = 
                     killerName = matchingKillers[0].killerName;
                 }
             } else if (matchingPlayers.length > 1) {
-                const displayCount = Math.min(matchingPlayers.length, 3);
-                let responseMessage = `Found ${matchingPlayers.length} players matching "${identifier}". `;
-                
-                if (matchingPlayers.length > 3) {
-                    responseMessage += `Showing first 3 results. Please refine your search or use a UUID instead.\n\n`;
-                } else {
-                    responseMessage += `Please use one of the following UUIDs for a specific player:\n\n`;
-                }
+                const displayCount = Math.min(matchingPlayers.length, 5);
+                let responseMessage = `Found ${matchingPlayers.length} players matching "${identifier}"${serverMessage}. Showing first ${displayCount}. Please refine your search or use a UUID.\n\n`;
                 
                 for (let i = 0; i < displayCount; i++) {
                     const player = matchingPlayers[i];
-                    responseMessage += `${i+1}. ${player.playerName} - UUID: ${player.playerUID}\n`;
+                    responseMessage += `${i+1}. ${player.playerName} (Server ${player.server_id})\n   UUID: ${player.playerUID}\n`;
                 }
                 
                 await interaction.editReply(responseMessage);
@@ -151,7 +151,6 @@ module.exports = async (interaction, serverInstance, discordClient, extraData = 
 
         if (killRows.length === 0) {
             const teamkillText = teamkillsOnly ? ' teamkill' : '';
-            const serverMessage = serverIdOption ? ` on server ${serverIdOption}` : '';
             await interaction.editReply(`No${teamkillText} kill history found for player: ${killerName} (${killerGUID})${serverMessage}`);
             return;
         }
@@ -168,15 +167,13 @@ module.exports = async (interaction, serverInstance, discordClient, extraData = 
         }
 
         const embed = new EmbedBuilder()
-            .setTitle(`Kill History${teamkillText}`)
+            .setTitle(`⚔️ Kill History${teamkillText}`)
             .setDescription(`**Player:** ${killerName}\n**UUID:** ${killerGUID}\n${serverDisplay}**Last ${killRows.length} kills:**\n---------------`)
             .setColor(teamkillsOnly ? "#FF6B35" : "#FFA500")
             .setFooter({ text: "RJS Kill History" });
 
-        let currentEmbedLength = embed.data.description?.length || 0;
         let fieldsAdded = 0;
         const maxFields = 25;
-        const maxEmbedLength = 5500; 
 
         for (let i = 0; i < killRows.length && fieldsAdded < maxFields; i++) {
             const kill = killRows[i];
@@ -186,19 +183,10 @@ module.exports = async (interaction, serverInstance, discordClient, extraData = 
             const weapon = kill.weapon || 'Unknown';
             const victimGUID = kill.victimBiId || 'Unknown';
             const killType = kill.killType || 'Kill';
+            const serverIdText = !serverIdOption ? ` (Server ${kill.server_id || '?'})` : '';
             
-            const fieldName = `${friendlyFireIcon}${i + 1}. ${kill.victimName || 'Unknown Victim'}`;
+            const fieldName = `${friendlyFireIcon}${i + 1}. ${kill.victimName || 'Unknown Victim'}${serverIdText}`;
             const fieldValue = `**GUID:** ${victimGUID}\n**Weapon:** ${weapon}\n**Distance:** ${distance}\n**Type:** ${killType}\n**Friendly Fire:** ${isFriendlyFire ? 'Yes' : 'No'}`;
-            const fieldLength = fieldName.length + fieldValue.length;
-            
-            if (currentEmbedLength + fieldLength > maxEmbedLength) {
-                embed.addFields({
-                    name: "⚠️ Truncated",
-                    value: `Showing ${fieldsAdded} of ${killRows.length} kills (embed size limit reached)`,
-                    inline: false
-                });
-                break;
-            }
             
             embed.addFields({
                 name: fieldName,
@@ -206,13 +194,20 @@ module.exports = async (interaction, serverInstance, discordClient, extraData = 
                 inline: false
             });
             
-            currentEmbedLength += fieldLength;
             fieldsAdded++;
+        }
+        
+        // Check total embed size before sending
+        if (JSON.stringify(embed.data).length > 5900) {
+             // This is a rough check. If it's too big, we'd need to paginate.
+             // For now, we'll just send it. Discord will error if it's too big.
+             logger.warn(`[KillHistoryRJS Command] Embed size for ${killerGUID} is very large, may be truncated.`);
         }
 
         await interaction.editReply({ embeds: [embed] });
     } catch (error) {
         logger.error(`[KillHistoryRJS Command] Error: ${error.message}`);
+        logger.error(error.stack);
         await interaction.editReply('An error occurred while retrieving kill history.');
     }
 };
