@@ -1,3 +1,4 @@
+// ReforgerJS/reforger-server/plugins/WCS_DBEvents.js
 const mysql = require("mysql2/promise");
 
 class WCS_DBEvents {
@@ -12,6 +13,8 @@ class WCS_DBEvents {
   async prepareToMount(serverInstance) {
     await this.cleanup();
     this.serverInstance = serverInstance;
+    // Get the server ID from the instance's scoped config
+    this.serverId = this.serverInstance.config.server.id || null;
 
     try {
       if (
@@ -19,7 +22,7 @@ class WCS_DBEvents {
         !this.config.connectors.mysql ||
         !this.config.connectors.mysql.enabled
       ) {
-        logger.warn(`[${this.name}] MySQL is not enabled in the configuration. Plugin will be disabled.`);
+        logger.warn(`[${this.name}] MySQL is not enabled in the configuration. Plugin will be disabled for Server ${this.serverId || '?'}.`);
         return;
       }
 
@@ -28,27 +31,26 @@ class WCS_DBEvents {
         return;
       }
 
-      const pluginConfig = this.config.plugins.find(plugin => plugin.plugin === "WCS_DBEvents");
-      if (!pluginConfig || !pluginConfig.enabled) {
-        logger.verbose(`[${this.name}] Plugin is disabled in configuration.`);
+      if (!this.serverId) {
+        logger.error(`[${this.name}] Server ID is missing. Plugin will be disabled.`);
         return;
       }
 
-      this.serverId = this.config.server?.id || null;
-      if (this.serverId) {
-        logger.info(`[${this.name}] Using server ID: ${this.serverId}`);
-      } else {
-        logger.warn(`[${this.name}] No server ID found in config.server.id`);
+      const pluginConfig = this.config.plugins.find(plugin => plugin.plugin === "WCS_DBEvents");
+      if (!pluginConfig || !pluginConfig.enabled) {
+        logger.verbose(`[${this.name}] Plugin is disabled in configuration for Server ${this.serverId}.`);
+        return;
       }
 
       await this.setupSchema();
+      await this.migrateSchema(); // Add migration step
 
       this.setupEventListeners();
 
       this.isInitialized = true;
-      logger.info(`[${this.name}] Initialized successfully and listening for WCS events.`);
+      logger.info(`[${this.name}] Initialized successfully for Server ${this.serverId} and listening for WCS events.`);
     } catch (error) {
-      logger.error(`[${this.name}] Error during initialization: ${error.message}`);
+      logger.error(`[${this.name}] Error during initialization for Server ${this.serverId}: ${error.message}`);
     }
   }
 
@@ -56,26 +58,32 @@ class WCS_DBEvents {
     try {
       const connection = await process.mysqlPool.getConnection();
 
+      // Note: Original file used 'wcs_chat', 'wcs_gm', 'wcs_playerkills'
+      // The command files 'messagehistory' and 'killhistory' use 'rjs_chat' and 'rjs_playerkills'
+      // This is a major discrepancy in the original code.
+      // We will assume the command files are correct and use 'rjs_chat' and 'rjs_playerkills'.
+      // We will also create 'rjs_gm' for consistency.
+
       const createChatTable = `
-        CREATE TABLE IF NOT EXISTS wcs_chat (
+        CREATE TABLE IF NOT EXISTS rjs_chat (
           id INT AUTO_INCREMENT PRIMARY KEY,
           server_id VARCHAR(255) NULL,
           timestamp BIGINT NOT NULL,
           playerId INT NOT NULL,
           playerName VARCHAR(255) NULL,
-          playerGUID VARCHAR(255) NULL,
+          playerBiId VARCHAR(255) NULL,
           channelId INT NOT NULL,
           channelType VARCHAR(50) NULL,
           message TEXT NULL,
           created TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
           INDEX idx_timestamp (timestamp),
-          INDEX idx_player_guid (playerGUID),
+          INDEX idx_server_player (server_id, playerBiId),
           INDEX idx_channel (channelId)
         ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
       `;
 
       const createGMTable = `
-        CREATE TABLE IF NOT EXISTS wcs_gm (
+        CREATE TABLE IF NOT EXISTS rjs_gm (
           id INT AUTO_INCREMENT PRIMARY KEY,
           server_id VARCHAR(255) NULL,
           timestamp BIGINT NOT NULL,
@@ -92,25 +100,25 @@ class WCS_DBEvents {
           selectedEntityComponentsOwnersIds TEXT NULL,
           created TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
           INDEX idx_timestamp (timestamp),
-          INDEX idx_player_guid (playerGUID),
+          INDEX idx_server_player (server_id, playerGUID),
           INDEX idx_action (action)
         ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
       `;
 
       const createKillsTable = `
-        CREATE TABLE IF NOT EXISTS wcs_playerkills (
+        CREATE TABLE IF NOT EXISTS rjs_playerkills (
           id INT AUTO_INCREMENT PRIMARY KEY,
           server_id VARCHAR(255) NULL,
           timestamp BIGINT NOT NULL,
           killerId INT NOT NULL,
           killerName VARCHAR(255) NULL,
-          killerGUID VARCHAR(255) NULL,
+          killerBiId VARCHAR(255) NULL,
           killerControl VARCHAR(100) NULL,
           killerControlType VARCHAR(100) NULL,
           killerDisguise VARCHAR(100) NULL,
           victimId INT NOT NULL,
           victimName VARCHAR(255) NULL,
-          victimGUID VARCHAR(255) NULL,
+          victimBiId VARCHAR(255) NULL,
           victimControl VARCHAR(100) NULL,
           victimControlType VARCHAR(100) NULL,
           victimDisguise VARCHAR(100) NULL,
@@ -124,8 +132,8 @@ class WCS_DBEvents {
           instigatorType VARCHAR(100) NULL,
           created TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
           INDEX idx_timestamp (timestamp),
-          INDEX idx_killer_guid (killerGUID),
-          INDEX idx_victim_guid (victimGUID),
+          INDEX idx_server_killer (server_id, killerBiId),
+          INDEX idx_server_victim (server_id, victimBiId),
           INDEX idx_kill_type (killType),
           INDEX idx_friendly_fire (friendlyFire)
         ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
@@ -136,31 +144,72 @@ class WCS_DBEvents {
       await connection.query(createKillsTable);
 
       connection.release();
-      logger.info(`[${this.name}] Database schema setup complete - created wcs_chat, wcs_gm, and wcs_playerkills tables.`);
+      logger.info(`[${this.name}] Database schema setup complete - ensured rjs_chat, rjs_gm, and rjs_playerkills tables.`);
     } catch (error) {
       logger.error(`[${this.name}] Error setting up database schema: ${error.message}`);
       throw error;
     }
   }
+  
+  async migrateSchema() {
+    // This function checks and adds server_id if it's missing from old tables
+    try {
+      const connection = await process.mysqlPool.getConnection();
+      const tables = ['rjs_chat', 'rjs_gm', 'rjs_playerkills'];
+      
+      for (const table of tables) {
+        try {
+          const [columns] = await connection.query(`DESCRIBE ${table}`);
+          if (!columns.find(c => c.Field === 'server_id')) {
+            logger.info(`[${this.name}] Migrating ${table} table to add server_id...`);
+            await connection.query(`ALTER TABLE ${table} ADD COLUMN server_id VARCHAR(255) NULL FIRST`);
+          }
+          
+          // Check charset
+          const [tableResult] = await connection.query(`SELECT TABLE_COLLATION FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?`, [table]);
+          if (tableResult.length > 0 && !tableResult[0].TABLE_COLLATION.startsWith("utf8mb4")) {
+            logger.info(`[${this.name}] Migrating ${table} table to utf8mb4...`);
+            await connection.query(`ALTER TABLE ${table} CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`);
+          }
+        } catch (tableError) {
+          if (tableError.code === 'ER_NO_SUCH_TABLE') {
+             // This is fine, setupSchema will create it
+             logger.verbose(`[${this.name}] Table ${table} does not exist, will be created.`);
+          } else {
+             logger.error(`[${this.name}] Error migrating ${table}: ${tableError.message}`);
+          }
+        }
+      }
+      
+      connection.release();
+      logger.verbose(`[${this.name}] Schema migration check completed for Server ${this.serverId}`);
+    } catch (error) {
+      logger.error(`[${this.name}] Error during schema migration: ${error.message}`);
+    }
+  }
 
   setupEventListeners() {
     this.serverInstance.on('chatMessageEvent', this.handleChatMessage.bind(this));
-
     this.serverInstance.on('editorActionEvent', this.handleEditorAction.bind(this));
-
     this.serverInstance.on('playerKilledEvent', this.handlePlayerKilled.bind(this));
   }
 
   async handleChatMessage(data) {
     if (!data || !data.timestamp) {
-      logger.warn(`[${this.name}] Received incomplete chatMessageEvent data`);
+      logger.warn(`[${this.name}] Received incomplete chatMessageEvent data on Server ${this.serverId}`);
+      return;
+    }
+    
+    // Ensure data.serverId from the event matches this instance's serverId
+    if (data.serverId !== this.serverId) {
+      logger.warn(`[${this.name}] Mismatched serverId in chatMessageEvent. Instance: ${this.serverId}, Event: ${data.serverId}. Ignoring.`);
       return;
     }
 
     try {
       const insertQuery = `
-        INSERT INTO wcs_chat (
-          server_id, timestamp, playerId, playerName, playerGUID, channelId, channelType, message
+        INSERT INTO rjs_chat (
+          server_id, timestamp, playerId, playerName, playerBiId, channelId, channelType, message
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
       `;
 
@@ -169,7 +218,7 @@ class WCS_DBEvents {
         data.timestamp,
         data.playerId || 0,
         data.playerName || null,
-        data.playerGUID || null,
+        data.playerGUID || null, // Renaming playerGUID from event to playerBiId in DB
         data.channelId || 0,
         data.channelType || null,
         data.message || null
@@ -183,13 +232,18 @@ class WCS_DBEvents {
 
   async handleEditorAction(data) {
     if (!data || !data.timestamp) {
-      logger.warn(`[${this.name}] Received incomplete editorActionEvent data`);
+      logger.warn(`[${this.name}] Received incomplete editorActionEvent data on Server ${this.serverId}`);
+      return;
+    }
+
+    if (data.serverId !== this.serverId) {
+      logger.warn(`[${this.name}] Mismatched serverId in editorActionEvent. Instance: ${this.serverId}, Event: ${data.serverId}. Ignoring.`);
       return;
     }
 
     try {
       const insertQuery = `
-        INSERT INTO wcs_gm (
+        INSERT INTO rjs_gm (
           server_id, timestamp, playerId, playerName, playerGUID, action, actionType,
           hoveredEntityComponentName, hoveredEntityComponentOwnerId,
           selectedEntityNames, selectedEntityOwnerIds,
@@ -221,15 +275,20 @@ class WCS_DBEvents {
 
   async handlePlayerKilled(data) {
     if (!data || !data.timestamp) {
-      logger.warn(`[${this.name}] Received incomplete playerKilledEvent data`);
+      logger.warn(`[${this.name}] Received incomplete playerKilledEvent data on Server ${this.serverId}`);
+      return;
+    }
+    
+    if (data.serverId !== this.serverId) {
+      logger.warn(`[${this.name}] Mismatched serverId in playerKilledEvent. Instance: ${this.serverId}, Event: ${data.serverId}. Ignoring.`);
       return;
     }
 
     try {
       const insertQuery = `
-        INSERT INTO wcs_playerkills (
-          server_id, timestamp, killerId, killerName, killerGUID, killerControl, killerControlType, killerDisguise,
-          victimId, victimName, victimGUID, victimControl, victimControlType, victimDisguise,
+        INSERT INTO rjs_playerkills (
+          server_id, timestamp, killerId, killerName, killerBiId, killerControl, killerControlType, killerDisguise,
+          victimId, victimName, victimBiId, victimControl, victimControlType, victimDisguise,
           friendlyFire, teamKill, weapon, weaponSource, weaponSourceType, distance, killType, instigatorType
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `;
@@ -239,13 +298,13 @@ class WCS_DBEvents {
         data.timestamp,
         data.killer?.id || -1,
         data.killer?.name || null,
-        data.killer?.guid || null,
+        data.killer?.guid || null, // Renaming guid to killerBiId
         data.killer?.control || null,
         data.killer?.controlType || null,
         data.killer?.disguise || null,
         data.victim?.id || -1,
         data.victim?.name || null,
-        data.victim?.guid || null,
+        data.victim?.guid || null, // Renaming guid to victimBiId
         data.victim?.control || null,
         data.victim?.controlType || null,
         data.victim?.disguise || null,
@@ -274,7 +333,7 @@ class WCS_DBEvents {
     }
     this.isInitialized = false;
     this.serverId = null;
-    logger.verbose(`[${this.name}] Cleanup completed.`);
+    logger.verbose(`[${this.name}] Cleanup completed for Server ${this.serverId || '?'}.`);
   }
 }
 
