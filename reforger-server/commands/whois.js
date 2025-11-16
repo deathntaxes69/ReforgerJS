@@ -1,3 +1,4 @@
+// reforger-server/commands/whois.js
 const { SlashCommandBuilder } = require('discord.js');
 
 module.exports = {
@@ -22,5 +23,11 @@ module.exports = {
                 .setName('value')
                 .setDescription('The value of the chosen identifier')
                 .setRequired(true)
+        )
+        .addIntegerOption(option =>
+            option
+                .setName('server')
+                .setDescription('Server Number (leave empty to search all servers)')
+                .setRequired(false)
         )
 };
