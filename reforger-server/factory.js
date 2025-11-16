@@ -1,3 +1,4 @@
+// reforger-server/factory.js
 const fs = require("fs");
 const path = require("path");
 const { Client, GatewayIntentBits, ActivityType } = require("discord.js");
@@ -24,7 +25,7 @@ function loadConfig(filePath) {
 }
 
 /**
- * Validate the config object.
+ * Validate the config object (new multi-server version).
  * Return `true` if valid, `false` if not.
  */
 function validateConfig(config) {
@@ -38,14 +39,33 @@ function validateConfig(config) {
     return false;
   }
 
-  // Validate the server configuration
-  if (!config.server || typeof config.server !== "object") {
-    logger.error("Invalid configuration: Missing or invalid server settings.");
+  // Validate the SERVERS array
+  if (!config.servers || !Array.isArray(config.servers) || config.servers.length === 0) {
+    logger.error("Invalid configuration: Missing or empty 'servers' array. Please check your config.json.");
     return false;
   }
-  if (!config.server.logDir || typeof config.server.logDir !== "string") {
-    logger.error("Invalid configuration: Missing or invalid log directory.");
-    return false;
+
+  const serverIds = new Set();
+  // Validate EACH server in the array
+  for (const serverConfig of config.servers) {
+    if (!serverConfig || typeof serverConfig !== "object") {
+      logger.error("Invalid configuration: A server object in the 'servers' array is invalid.");
+      return false;
+    }
+    if (!serverConfig.id || typeof serverConfig.id !== 'number') {
+        logger.error(`Invalid configuration for server ${serverConfig.name || 'Unknown'}: Missing or invalid 'id' (must be a unique number).`);
+        return false;
+    }
+    if (serverIds.has(serverConfig.id)) {
+      logger.error(`Invalid configuration: Duplicate server 'id' found: ${serverConfig.id}. Each server must have a unique 'id'.`);
+      return false;
+    }
+    serverIds.add(serverConfig.id);
+
+    if (!serverConfig.logDir || typeof serverConfig.logDir !== "string") {
+      logger.error(`Invalid configuration for server ${serverConfig.name} (ID: ${serverConfig.id}): Missing or invalid log directory.`);
+      return false;
+    }
   }
 
   // Validate the connectors configuration
@@ -94,29 +114,13 @@ function validateConfig(config) {
 }
 
 /**
- * Perform additional startup checks and tasks, such as:
- * - Verifying log directories
- * - Connecting to Discord
- * - Connecting to MySQL with reconnection logic
+ * Perform GLOBAL startup checks (Discord, DB, BattleMetrics).
+ * These are run only ONCE.
  */
-async function performStartupChecks(config) {
+async function performGlobalStartupChecks(config) {
   let discordClient = null; // Initialize to null
 
-  // 1) Ensure the log directory exists
-  if (config.server.logReaderMode === "tail") {
-    if (!fs.existsSync(config.server.logDir)) {
-      logger.error(`Log directory not found: ${config.server.logDir}`);
-      throw new Error(`Log directory not found: ${config.server.logDir}`);
-    } else {
-      logger.info(`Log directory verified: ${config.server.logDir}`);
-    }
-  } else {
-    logger.info(
-      `Skipping local log directory check for mode: ${config.server.logReaderMode}`
-    );
-  }
-
-  // 3) Connect to Discord (if token is present)
+  // 1) Connect to Discord (if token is present)
   const discordConfig = config.connectors.discord;
   if (discordConfig && discordConfig.token) {
     discordClient = new Client({
@@ -181,7 +185,7 @@ async function performStartupChecks(config) {
     }
   }
 
-  // 4) Connect to MySQL if enabled with reconnection logic
+  // 2) Connect to MySQL if enabled with reconnection logic
   if (config.connectors.mysql && config.connectors.mysql.enabled) {
     const mysqlConfig = config.connectors.mysql;
     const maxRetries = Infinity;
@@ -252,7 +256,7 @@ async function performStartupChecks(config) {
     });
   }
 
-  // 5) Battlemetrics API initialization
+  // 3) Battlemetrics API initialization
   if (
     config.connectors.battlemetrics &&
     config.connectors.battlemetrics.enabled
@@ -280,8 +284,32 @@ async function performStartupChecks(config) {
   return discordClient;
 }
 
+/**
+ * Perform PER-SERVER startup checks.
+ * This is run for EACH server in the config.
+ * @param {object} scopedConfig - A config object where `config.server` is the specific server.
+ */
+async function performServerStartupChecks(scopedConfig) {
+  const serverConfig = scopedConfig.server;
+  
+  // 1) Ensure the log directory exists
+  if (serverConfig.logReaderMode === "tail") {
+    if (!fs.existsSync(serverConfig.logDir)) {
+      logger.error(`[Server ${serverConfig.id}] Log directory not found: ${serverConfig.logDir}`);
+      throw new Error(`[Server ${serverConfig.id}] Log directory not found: ${serverConfig.logDir}`);
+    } else {
+      logger.info(`[Server ${serverConfig.id}] Log directory verified: ${serverConfig.logDir}`);
+    }
+  } else {
+    logger.info(
+      `[Server ${serverConfig.id}] Skipping local log directory check for mode: ${serverConfig.logReaderMode}`
+    );
+  }
+}
+
 module.exports = {
   loadConfig,
   validateConfig,
-  performStartupChecks,
+  performGlobalStartupChecks,
+  performServerStartupChecks,
 };
