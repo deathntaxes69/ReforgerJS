@@ -1,7 +1,8 @@
+// ReforgerJS/reforger-server/commandFunctions/stats.js
 const { EmbedBuilder } = require('discord.js');
 const mysql = require('mysql2/promise');
 
-module.exports = async (interaction, serverInstance, discordClient, extraData = {}) => {
+module.exports = async (interaction, serverInstances, discordClient, extraData = {}) => {
     const identifier = interaction.options.getString('identifier');
     const serverIdOption = interaction.options.getInteger('server');
     const user = interaction.user;
@@ -12,24 +13,31 @@ module.exports = async (interaction, serverInstance, discordClient, extraData = 
     }
 
     try {
-        const pool = process.mysqlPool || serverInstance.mysqlPool;
+        const pool = process.mysqlPool; // Use global pool
         if (!pool) {
             await interaction.editReply('Database connection is not initialized.');
             return;
         }
 
-        const statsConfig = serverInstance.config.commands.find(c => c.command === 'stats');
+        // Get config from the first instance (all configs are the same besides .server)
+        const mainConfig = serverInstances[0]?.config;
+        if (!mainConfig) {
+            await interaction.editReply('Cannot find bot configuration.');
+            return;
+        }
+
+        const statsConfig = mainConfig.commands.find(c => c.command === 'stats');
         if (!statsConfig || !statsConfig.statsTable) {
-            await interaction.editReply('Stats command is not properly configured.');
+            await interaction.editReply('Stats command is not properly configured in config.json (missing "statsTable").');
             return;
         }
         
         const statsTable = statsConfig.statsTable;
-        const totalServers = statsConfig.servers || 1;
+        const totalServers = mainConfig.servers?.length || 1; // Get server count from new servers array
 
         if (serverIdOption !== null && serverIdOption !== undefined) {
-            if (serverIdOption <= 0 || serverIdOption > totalServers) {
-                await interaction.editReply(`Invalid server ID. Please enter a server number between 1 and ${totalServers}, or leave empty for combined stats.`);
+            if (!mainConfig.servers.find(s => s.id === serverIdOption)) {
+                await interaction.editReply(`Invalid server ID. No server with ID ${serverIdOption} is configured.`);
                 return;
             }
         }
@@ -37,7 +45,7 @@ module.exports = async (interaction, serverInstance, discordClient, extraData = 
         const [statsTableCheck] = await pool.query(`SHOW TABLES LIKE ?`, [statsTable]);
         const [playersTableCheck] = await pool.query(`SHOW TABLES LIKE 'players'`);
         if (!statsTableCheck.length || !playersTableCheck.length) {
-            await interaction.editReply('Required tables (players/stats) are missing in the database.');
+            await interaction.editReply('Required tables (players/stats) are missing in the database. Ensure DBLog and DBLogStats plugins are enabled.');
             return;
         }
 
@@ -53,19 +61,42 @@ module.exports = async (interaction, serverInstance, discordClient, extraData = 
         const isUUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(identifier);
         
         let playerUID;
-        let playerName;
+        let playerName = 'Unknown Player';
+        
+        // Build server filter
+        const serverFilter = serverIdOption ? `AND server_id = ?` : '';
+        const serverParam = serverIdOption ? [serverIdOption.toString()] : [];
 
         if (isUUID) {
             playerUID = identifier;
+            
+            // Try to find the player's name
+            try {
+                const [playerRow] = await pool.query(
+                    `SELECT playerName FROM players WHERE playerUID = ? ${serverFilter} LIMIT 1`, 
+                    [playerUID, ...serverParam]
+                );
+                if (playerRow.length > 0) {
+                    playerName = playerRow[0].playerName;
+                } else {
+                    const [anyPlayerRow] = await pool.query(
+                        `SELECT playerName FROM players WHERE playerUID = ? LIMIT 1`, 
+                        [playerUID]
+                    );
+                    if (anyPlayerRow.length > 0) playerName = anyPlayerRow[0].playerName;
+                }
+            } catch (e) {
+                logger.warn(`[Stats Command] Could not fetch player name for ${playerUID}: ${e.message}`);
+            }
             
             const hasServerIdColumn = availableColumns.includes('server_id');
             
             let existsQuery = `SELECT (
                 EXISTS (SELECT 1 FROM \`${statsTable}\` WHERE playerUID = ? ${serverIdOption && hasServerIdColumn ? `AND server_id = '${serverIdOption}'` : ''}) 
-                OR EXISTS (SELECT 1 FROM players WHERE playerUID = ?)
+                OR EXISTS (SELECT 1 FROM players WHERE playerUID = ? ${serverFilter})
             ) AS existsInDB`;
             
-            const [[playerExists]] = await pool.query(existsQuery, [playerUID, playerUID]);
+            const [[playerExists]] = await pool.query(existsQuery, [playerUID, playerUID, ...serverParam]);
             
             if (!playerExists.existsInDB) {
                 const serverMessage = serverIdOption ? ` on server ${serverIdOption}` : '';
@@ -73,30 +104,29 @@ module.exports = async (interaction, serverInstance, discordClient, extraData = 
                 return;
             }
             
-            const [playerRow] = await pool.query(`SELECT playerName FROM players WHERE playerUID = ?`, [playerUID]);
-            playerName = (playerRow.length > 0) ? playerRow[0].playerName : 'Unknown Player';
         } else {
+            // Find by name
             const [matchingPlayers] = await pool.query(
-                `SELECT playerUID, playerName FROM players WHERE playerName LIKE ?`,
-                [`%${identifier}%`]
+                `SELECT DISTINCT playerUID, playerName, server_id FROM players WHERE playerName LIKE ? ${serverFilter}`,
+                [`%${identifier}%`, ...serverParam]
             );
             
             if (matchingPlayers.length === 0) {
-                await interaction.editReply(`No players found with name containing: ${identifier}`);
+                await interaction.editReply(`No players found with name containing: ${identifier}${serverIdOption ? ` on server ${serverIdOption}` : ''}`);
                 return;
             } else if (matchingPlayers.length > 1) {
-                const displayCount = Math.min(matchingPlayers.length, 3);
+                const displayCount = Math.min(matchingPlayers.length, 5);
                 let responseMessage = `Found ${matchingPlayers.length} players matching "${identifier}". `;
                 
-                if (matchingPlayers.length > 3) {
-                    responseMessage += `Showing first 3 results. Please refine your search or use a UUID instead.\n\n`;
+                if (matchingPlayers.length > 5) {
+                    responseMessage += `Showing first 5 results. Please refine your search or use a UUID instead.\n\n`;
                 } else {
                     responseMessage += `Please use one of the following UUIDs for a specific player:\n\n`;
                 }
                 
                 for (let i = 0; i < displayCount; i++) {
                     const player = matchingPlayers[i];
-                    responseMessage += `${i+1}. ${player.playerName} - UUID: ${player.playerUID}\n`;
+                    responseMessage += `${i+1}. ${player.playerName} (Server ${player.server_id})\n   UUID: ${player.playerUID}\n`;
                 }
                 
                 await interaction.editReply(responseMessage);
@@ -131,7 +161,8 @@ module.exports = async (interaction, serverInstance, discordClient, extraData = 
         
         const existingCoreColumns = filterExistingColumns(coreColumns);
         const existingOptionalColumns = filterExistingColumns(optionalColumns);
-        const allExistingColumns = [...existingCoreColumns, ...existingOptionalColumns];
+        // Ensure we don't select server_id explicitly, as we handle it in GROUP_CONCAT
+        const allExistingColumns = [...existingCoreColumns, ...existingOptionalColumns].filter(col => col !== 'server_id');
         
         let statsQuery;
         let queryParams;
@@ -140,20 +171,21 @@ module.exports = async (interaction, serverInstance, discordClient, extraData = 
             statsQuery = `SELECT ${allExistingColumns.join(', ')} FROM \`${statsTable}\` WHERE playerUID = ? AND server_id = ?`;
             queryParams = [playerUID, serverIdOption.toString()];
         } else {
+            // Sum stats across all servers
             const selectClauses = [];
             
             allExistingColumns.forEach(col => {
                 if (col === 'playerUID') {
                     selectClauses.push('playerUID');
                 } else if (col === 'level') {
-                    selectClauses.push('MAX(level) as level');
+                    selectClauses.push('MAX(level) as level'); // Get max level across servers
                 } else if (col !== 'server_id') {
-                    selectClauses.push(`SUM(${col}) as ${col}`);
+                    selectClauses.push(`SUM(${col}) as ${col}`); // Sum all other stats
                 }
             });
             
             if (hasServerIdColumn) {
-                selectClauses.push('GROUP_CONCAT(DISTINCT server_id) as servers');
+                selectClauses.push('GROUP_CONCAT(DISTINCT server_id ORDER BY server_id) as servers');
             }
             
             statsQuery = `
@@ -181,6 +213,8 @@ module.exports = async (interaction, serverInstance, discordClient, extraData = 
         } else if (stats.servers && hasServerIdColumn) {
             const serverList = stats.servers.split(',').filter(Boolean);
             serverDisplay = `**Servers:** ${serverList.join(', ')}\n`;
+        } else if (!hasServerIdColumn) {
+            serverDisplay = `**Server:** (Stats Combined - Pre-multiserver)\n`;
         }
 
         const metersToKm = meters => (meters / 1000).toFixed(2);
