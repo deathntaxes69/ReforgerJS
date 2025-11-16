@@ -1,3 +1,4 @@
+// ReforgerJS/reforger-server/commands/voteinfo.js
 const { SlashCommandBuilder } = require('discord.js');
 
 module.exports = {
@@ -9,5 +10,11 @@ module.exports = {
                 .setName('uuid')
                 .setDescription('The UUID of the player')
                 .setRequired(true)
+        )
+        .addIntegerOption(option =>
+            option
+                .setName('server')
+                .setDescription('Server Number (leave empty to search all servers)')
+                .setRequired(false)
         )
 };
