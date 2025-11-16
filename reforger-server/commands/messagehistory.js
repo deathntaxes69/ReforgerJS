@@ -1,3 +1,4 @@
+// reforger-server/commands/messagehistory.js
 const { SlashCommandBuilder } = require('discord.js');
 
 module.exports = {
