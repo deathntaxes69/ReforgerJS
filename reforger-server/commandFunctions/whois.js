@@ -1,26 +1,30 @@
+// reforger-server/commandFunctions/whois.js
 const mysql = require("mysql2/promise");
+const { EmbedBuilder } = require('discord.js');
 
-module.exports = async (interaction, serverInstance, discordClient, extraData = {}) => {
+module.exports = async (interaction, serverInstances, discordClient, extraData = {}) => {
     try {
         if (!interaction.deferred && !interaction.replied) {
             await interaction.deferReply({ ephemeral: true });
         }
 
         const user = interaction.user;
-        const identifier = extraData.identifier;
-        const value = extraData.value;
+        const identifier = interaction.options.getString('identifier');
+        const value = interaction.options.getString('value');
+        const serverIdOption = interaction.options.getInteger('server');
         
-        logger.info(`[Whois Command] User: ${user.username} (ID: ${user.id}) used /whois with Identifier: ${identifier}, Value: ${value}`);
+        logger.info(`[Whois Command] User: ${user.username} (ID: ${user.id}) used /whois with Identifier: ${identifier}, Value: ${value}, Server: ${serverIdOption || 'ALL'}`);
 
-        if (!serverInstance.config.connectors ||
-            !serverInstance.config.connectors.mysql ||
-            !serverInstance.config.connectors.mysql.enabled) {
+        // Check if MySQL is enabled in the main config
+        const mainConfig = serverInstances[0]?.config;
+        if (!mainConfig || !mainConfig.connectors ||
+            !mainConfig.connectors.mysql ||
+            !mainConfig.connectors.mysql.enabled) {
             await interaction.editReply('MySQL is not enabled in the configuration. This command cannot be used.');
             return;
         }
 
-        const pool = process.mysqlPool || serverInstance.mysqlPool;
-
+        const pool = process.mysqlPool; // Use the global pool
         if (!pool) {
             await interaction.editReply('Database connection is not initialized.');
             return;
@@ -52,18 +56,22 @@ module.exports = async (interaction, serverInstance, discordClient, extraData = 
             let query;
             let params;
             
+            // Build server filter
+            const serverFilter = serverIdOption ? `AND server_id = ?` : '';
+            const serverParam = serverIdOption ? [serverIdOption.toString()] : [];
+
             if (dbField === 'playerName') {
-                query = `SELECT playerName, playerIP, playerUID, beGUID, steamID, device FROM players WHERE ${dbField} LIKE ?`;
-                params = [`%${value}%`];
+                query = `SELECT playerName, playerIP, playerUID, beGUID, steamID, device, server_id FROM players WHERE ${dbField} LIKE ? ${serverFilter}`;
+                params = [`%${value}%`, ...serverParam];
             } else {
-                query = `SELECT playerName, playerIP, playerUID, beGUID, steamID, device FROM players WHERE ${dbField} = ?`;
-                params = [value];
+                query = `SELECT playerName, playerIP, playerUID, beGUID, steamID, device, server_id FROM players WHERE ${dbField} = ? ${serverFilter}`;
+                params = [value, ...serverParam];
             }
 
             const [rows] = await pool.query(query, params);
 
             if (rows.length === 0) {
-                await interaction.editReply(`No information can be found for ${identifier}: ${value}`);
+                await interaction.editReply(`No information can be found for ${identifier}: ${value}${serverIdOption ? ` on server ${serverIdOption}` : ''}`);
                 return;
             }
 
@@ -80,6 +88,7 @@ module.exports = async (interaction, serverInstance, discordClient, extraData = 
                 for (let i = 0; i < displayCount; i++) {
                     const player = rows[i];
                     let playerDetails = `${i+1}. ${player.playerName || 'Unknown'}\n` +
+                                       `   Server ID: ${player.server_id || 'Unknown'}\n` +
                                        `   UUID: ${player.playerUID || 'Missing'}\n` +
                                        `   IP: ${player.playerIP || 'Missing'}\n` +
                                        `   beGUID: ${player.beGUID || 'Missing'}\n` +
@@ -92,63 +101,55 @@ module.exports = async (interaction, serverInstance, discordClient, extraData = 
                     responseMessage += playerDetails + '\n';
                 }
                 
+                // Check if the response is too long for a single Discord reply
+                if (responseMessage.length > 2000) {
+                    responseMessage = responseMessage.substring(0, 1997) + '...';
+                }
+                
                 await interaction.editReply(responseMessage);
                 return;
             }
 
             const embeds = [];
-            let currentEmbed = {
-                title: 'Reforger Lookup Directory',
-                description: `🔍 Whois: ${value}\n\n`,
-                color: 0xFFA500,
-                fields: [],
-                footer: {
-                    text: 'ReforgerJS'
-                }
-            };
+            let currentEmbed = new EmbedBuilder()
+                .setTitle('Reforger Lookup Directory')
+                .setDescription(`🔍 Whois: ${value}\n${serverIdOption ? `**Server:** ${serverIdOption}\n` : ''}\n`)
+                .setColor(0xFFA500)
+                .setFooter({ text: 'ReforgerJS' });
 
             rows.forEach((player, index) => {
-                let playerInfo = `Name: ${player.playerName || 'Missing Player Name'}\n` +
-                               `IP Address: ${player.playerIP || 'Missing IP Address'}\n` +
-                               `Reforger UUID: ${player.playerUID || 'Missing UUID'}\n` +
-                               `be GUID: ${player.beGUID || 'Missing beGUID'}\n` +
-                               `Device: ${player.device || 'Not Found'}`;
+                let playerInfo = `**Name:** ${player.playerName || 'Missing Player Name'}\n` +
+                               `**Server ID:** ${player.server_id || 'Unknown'}\n` +
+                               `**IP Address:** ${player.playerIP || 'Missing IP Address'}\n` +
+                               `**Reforger UUID:** ${player.playerUID || 'Missing UUID'}\n` +
+                               `**be GUID:** ${player.beGUID || 'Missing beGUID'}\n` +
+                               `**Device:** ${player.device || 'Not Found'}`;
                 
                 if (player.device === 'PC') {
-                    playerInfo += `\nSteamID: ${player.steamID || 'Not Found'}`;
+                    playerInfo += `\n**SteamID:** ${player.steamID || 'Not Found'}`;
                 }
                 
-                const playerData = {
-                    name: `Player ${index + 1}`,
-                    value: playerInfo
-                };
+                const fieldName = rows.length > 1 ? `Player ${index + 1}` : 'Player Information';
 
-                currentEmbed.fields.push(playerData);
-
-                const embedLength = JSON.stringify(currentEmbed).length;
-                if (embedLength >= 5900) {
+                // Check embed limits
+                if (currentEmbed.data.fields && currentEmbed.data.fields.length >= 25) {
                     embeds.push(currentEmbed);
-                    currentEmbed = {
-                        title: 'Reforger Lookup Directory (Continued)',
-                        description: '',
-                        color: 0xFFA500,
-                        fields: [],
-                        footer: {
-                            text: 'ReforgerJS'
-                        }
-                    };
+                    currentEmbed = new EmbedBuilder()
+                        .setTitle('Reforger Lookup Directory (Continued)')
+                        .setColor(0xFFA500)
+                        .setFooter({ text: 'ReforgerJS' });
                 }
+                
+                currentEmbed.addFields({ name: fieldName, value: playerInfo });
             });
 
-            if (currentEmbed.fields.length > 0) {
-                embeds.push(currentEmbed);
-            }
+            embeds.push(currentEmbed);
 
-            for (const embed of embeds) {
-                if (embeds.indexOf(embed) === 0) {
-                    await interaction.editReply({ embeds: [embed] });
+            for (let i = 0; i < embeds.length; i++) {
+                if (i === 0) {
+                    await interaction.editReply({ embeds: [embeds[i]] });
                 } else {
-                    await interaction.followUp({ embeds: [embed], ephemeral: true });
+                    await interaction.followUp({ embeds: [embeds[i]], ephemeral: true });
                 }
             }
         } catch (queryError) {
