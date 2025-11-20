@@ -1,6 +1,8 @@
 const mysql = require("mysql2/promise");
 const fs = require("fs").promises;
 const pathModule = require("path");
+const SftpClient = require('ssh2-sftp-client');
+const logger = global.logger || console;
 
 class DBLogStats {
   constructor(config) {
@@ -12,29 +14,27 @@ class DBLogStats {
     this.folderPath = null;
     this.tableName = null;
     this.serverId = null;
+    this.isRemote = false;
   }
 
   async prepareToMount(serverInstance) {
     logger.verbose(`[${this.name}] Preparing to mount...`);
     this.serverInstance = serverInstance;
+    this.serverId = this.serverInstance.config.server.id || null;
 
     try {
-      if (
-        !this.config.connectors ||
-        !this.config.connectors.mysql ||
-        !this.config.connectors.mysql.enabled
-      ) {
-        logger.warn(`[${this.name}] MySQL is not enabled in the configuration. Plugin will be disabled.`);
+      if (!this.config.connectors?.mysql?.enabled || !process.mysqlPool) {
+        logger.warn(`[${this.name}] MySQL is not enabled. Plugin disabled.`);
         return;
       }
-      if (!process.mysqlPool) {
-        logger.error(`[${this.name}] MySQL pool is not available. Ensure MySQL is connected before enabling this plugin.`);
+
+      if (!this.serverId) {
+        logger.error(`[${this.name}] Server ID missing. Plugin disabled.`);
         return;
       }
 
       const pluginConfig = this.config.plugins.find(plugin => plugin.plugin === "DBLogStats");
-      if (!pluginConfig) {
-        logger.warn(`[${this.name}] Plugin configuration not found. Plugin disabled.`);
+      if (!pluginConfig || !pluginConfig.enabled) {
         return;
       }
 
@@ -43,34 +43,34 @@ class DBLogStats {
       }
 
       if (!pluginConfig.path) {
-        logger.warn(`[${this.name}] 'path' not specified in config. Plugin disabled.`);
+        logger.warn(`[${this.name}] 'path' not specified. Plugin disabled.`);
         return;
       }
+      
       this.folderPath = pluginConfig.path;
-      try {
-        await fs.access(this.folderPath);
-      } catch (err) {
-        logger.error(`[${this.name}] Folder path '${this.folderPath}' not found. Plugin disabled.`);
-        return;
-      }
+      this.tableName = pluginConfig.tableName || "player_stats";
 
-      if (!pluginConfig.tableName) {
-        logger.warn(`[${this.name}] 'tableName' not specified in config. Plugin disabled.`);
-        return;
-      }
-      this.tableName = pluginConfig.tableName;
-
-      if (!this.config.server || !this.config.server.id) {
-        logger.info(`[${this.name}] 'server.id' not found in config. Multi-server stats will not be available.`);
+      // Check if we should use SFTP based on server config
+      const serverConfig = this.serverInstance.config.server;
+      if (serverConfig.logReaderMode === 'sftp' || serverConfig.sftp) {
+          this.isRemote = true;
+          logger.info(`[${this.name}] Mode: SFTP Remote Access (Path: ${this.folderPath})`);
       } else {
-        this.serverId = this.config.server.id;
+          // Local mode check
+          try {
+            await fs.access(this.folderPath);
+            logger.info(`[${this.name}] Mode: Local File Access (Path: ${this.folderPath})`);
+          } catch (err) {
+            logger.error(`[${this.name}] Local path '${this.folderPath}' not found. Plugin disabled.`);
+            return;
+          }
       }
 
       await this.setupSchema();
       await this.migrateSchema();
 
       this.startLogging();
-      logger.info(`[${this.name}] Initialized and started logging stats every ${this.logIntervalMinutes} minutes for server ID: ${this.serverId || 'undefined'}.`);
+      logger.info(`[${this.name}] Initialized for Server ${this.serverId}. Logging every ${this.logIntervalMinutes} min.`);
     } catch (error) {
       logger.error(`[${this.name}] Error during initialization: ${error.message}`);
     }
@@ -80,7 +80,8 @@ class DBLogStats {
     const createTableQuery = `
       CREATE TABLE IF NOT EXISTS \`${this.tableName}\` (
         id INT AUTO_INCREMENT PRIMARY KEY,
-        playerUID VARCHAR(255) NOT NULL UNIQUE,
+        playerUID VARCHAR(255) NOT NULL,
+        server_id VARCHAR(255) NULL,
         level FLOAT DEFAULT 0,
         level_experience FLOAT DEFAULT 0,
         session_duration FLOAT DEFAULT 0,
@@ -120,16 +121,15 @@ class DBLogStats {
         lightban_streak FLOAT DEFAULT 0,
         heavyban_kick_session_duration FLOAT DEFAULT 0,
         heavyban_streak FLOAT DEFAULT 0,
-        created TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        created TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE KEY player_server_unique (playerUID, server_id)
     ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
   `;
     try {
       const connection = await process.mysqlPool.getConnection();
       await connection.query(createTableQuery);
       connection.release();
-      logger.verbose(`[${this.name}] Database schema ensured for table '${this.tableName}'.`);
     } catch (error) {
-      logger.error(`[${this.name}] Failed to set up database schema: ${error.message}`);
       throw error;
     }
   }
@@ -139,80 +139,39 @@ class DBLogStats {
       const alterQueries = [];
       const connection = await process.mysqlPool.getConnection();
       
-      const [columns] = await connection.query(`
-        SELECT COLUMN_NAME 
-        FROM INFORMATION_SCHEMA.COLUMNS 
-        WHERE TABLE_SCHEMA = DATABASE() 
-        AND TABLE_NAME = '${this.tableName}'
-      `);
-      
-      const columnNames = columns.map(col => col.COLUMN_NAME);
+      const [columns] = await connection.query(`DESCRIBE \`${this.tableName}\``);
+      const columnNames = columns.map(col => col.Field);
       
       if (!columnNames.includes('server_id')) {
-        alterQueries.push('ADD COLUMN server_id VARCHAR(255) NULL');
+        alterQueries.push('ADD COLUMN server_id VARCHAR(255) NULL AFTER playerUID');
       }
+      // Add other columns if missing...
+      const optionalCols = ['lightban_session_duration', 'lightban_streak', 'heavyban_kick_session_duration', 'heavyban_streak'];
+      optionalCols.forEach(col => {
+          if (!columnNames.includes(col)) alterQueries.push(`ADD COLUMN ${col} FLOAT DEFAULT 0`);
+      });
 
-      if (!columnNames.includes('lightban_session_duration')) {
-        alterQueries.push('ADD COLUMN lightban_session_duration FLOAT DEFAULT 0');
-      }
-      if (!columnNames.includes('lightban_streak')) {
-        alterQueries.push('ADD COLUMN lightban_streak FLOAT DEFAULT 0');
-      }
-      if (!columnNames.includes('heavyban_kick_session_duration')) {
-        alterQueries.push('ADD COLUMN heavyban_kick_session_duration FLOAT DEFAULT 0');
-      }
-      if (!columnNames.includes('heavyban_streak')) {
-        alterQueries.push('ADD COLUMN heavyban_streak FLOAT DEFAULT 0');
-      }
+      // Check index
+      const [indexes] = await connection.query(`SHOW INDEX FROM \`${this.tableName}\``);
+      const uidIndex = indexes.find(i => i.Column_name === 'playerUID' && i.Key_name !== 'player_server_unique');
+      const compositeIndex = indexes.find(i => i.Key_name === 'player_server_unique');
 
-      const [indexes] = await connection.query(`
-        SELECT INDEX_NAME
-        FROM INFORMATION_SCHEMA.STATISTICS
-        WHERE TABLE_SCHEMA = DATABASE()
-        AND TABLE_NAME = '${this.tableName}'
-        AND COLUMN_NAME = 'playerUID'
-        AND NON_UNIQUE = 0
-      `);
-
-          const [tableResult] = await connection.query(`
-      SELECT TABLE_COLLATION 
-      FROM information_schema.TABLES 
-      WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = '${this.tableName}'
-    `);
-    
-    if (tableResult.length > 0 && !tableResult[0].TABLE_COLLATION.startsWith("utf8mb4")) {
-      alterQueries.push('CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci');
-    }
-
-      if (indexes.length > 0 && indexes[0].INDEX_NAME === 'playerUID') {
-        alterQueries.push('DROP INDEX playerUID');
-        alterQueries.push('ADD UNIQUE INDEX playerUID_server_id (playerUID, server_id)');
+      if (uidIndex) {
+        alterQueries.push(`DROP INDEX \`${uidIndex.Key_name}\``);
+        if (!compositeIndex) alterQueries.push('ADD UNIQUE INDEX player_server_unique (playerUID, server_id)');
+      } else if (!compositeIndex) {
+        alterQueries.push('ADD UNIQUE INDEX player_server_unique (playerUID, server_id)');
       }
       
       if (alterQueries.length > 0) {
         const alterQuery = `ALTER TABLE ${this.tableName} ${alterQueries.join(', ')}`;
         await connection.query(alterQuery);
-        logger.info(`DBLog: Migrated stats table with new columns: ${alterQueries.join(', ')}`);
-      } else {
-        logger.info(`DBLog: No migration needed for stats table.`);
+        logger.info(`[${this.name}] Migrated schema for ${this.tableName}`);
       }
       
       connection.release();
     } catch (error) {
       logger.error(`Error migrating schema: ${error.message}`);
-      throw error;
-    }
-  }
-
-  async clearTable() {
-    logger.verbose(`[${this.name}] Clearing table '${this.tableName}'...`);
-    try {
-      const connection = await process.mysqlPool.getConnection();
-      await connection.query(`DELETE FROM \`${this.tableName}\``);
-      connection.release();
-      logger.verbose(`[${this.name}] Cleared table '${this.tableName}'.`);
-    } catch (error) {
-      logger.error(`[${this.name}] Failed to clear table: ${error.message}`);
     }
   }
 
@@ -220,13 +179,139 @@ class DBLogStats {
     const intervalMs = this.logIntervalMinutes * 60 * 1000;
     this.logStats();
     this.interval = setInterval(() => this.logStats(), intervalMs);
-    logger.verbose(`[${this.name}] Started logging every ${this.logIntervalMinutes} minutes.`);
+  }
+
+  async getRemoteFiles() {
+    const sftp = new SftpClient();
+    const playerStatData = {};
+    
+    try {
+        const sftpConfig = this.serverInstance.config.server.sftp;
+        await sftp.connect(sftpConfig);
+        
+        const fileList = await sftp.list(this.folderPath);
+        const statFiles = fileList.filter(f => f.type === '-' && /^PlayerData\..+\.json$/.test(f.name));
+
+        if (statFiles.length === 0) {
+             logger.verbose(`[${this.name}] No stat files found in remote ${this.folderPath}`);
+             await sftp.end();
+             return null;
+        }
+
+        logger.info(`[${this.name}] Downloading ${statFiles.length} stat files via SFTP...`);
+
+        for (const file of statFiles) {
+            const match = /^PlayerData\.(.+)\.json$/.exec(file.name);
+            if (!match) continue;
+            const playerUID = match[1];
+            
+            try {
+                const buffer = await sftp.get(this.folderPath + '/' + file.name);
+                const jsonData = JSON.parse(buffer.toString());
+                
+                if (jsonData.m_aStats && Array.isArray(jsonData.m_aStats)) {
+                    playerStatData[playerUID] = jsonData.m_aStats;
+                }
+            } catch (err) {
+                logger.warn(`[${this.name}] Failed to process remote file ${file.name}: ${err.message}`);
+            }
+        }
+        
+        await sftp.end();
+        return playerStatData;
+
+    } catch (err) {
+        logger.error(`[${this.name}] SFTP Error: ${err.message}`);
+        if (sftp) sftp.end(); 
+        return null;
+    }
+  }
+
+  async getLocalFiles() {
+      const playerStatData = {};
+      const files = await fs.readdir(this.folderPath);
+      const statFiles = files.filter(file => /^PlayerData\..+\.json$/.test(file));
+
+      for (const file of statFiles) {
+        const match = /^PlayerData\.(.+)\.json$/.exec(file);
+        if (!match) continue;
+        const playerUID = match[1];
+        
+        try {
+            const content = await fs.readFile(pathModule.join(this.folderPath, file), "utf8");
+            const jsonData = JSON.parse(content);
+            if (jsonData.m_aStats && Array.isArray(jsonData.m_aStats)) {
+                playerStatData[playerUID] = jsonData.m_aStats;
+            }
+        } catch (err) { /* ignore read errors */ }
+      }
+      return playerStatData;
+  }
+
+  async collectStats() {
+    logger.verbose(`[${this.name}] Collecting stats...`);
+    
+    let rawStats = {};
+    if (this.isRemote) {
+        rawStats = await this.getRemoteFiles();
+    } else {
+        rawStats = await this.getLocalFiles();
+    }
+
+    if (!rawStats) return null;
+
+    const processedStats = {};
+    for (const [uid, statsArray] of Object.entries(rawStats)) {
+        if (statsArray.length < 35) continue;
+        
+        processedStats[uid] = {
+          level: statsArray[0],
+          level_experience: statsArray[1],
+          session_duration: statsArray[2],
+          sppointss0: statsArray[3],
+          sppointss1: statsArray[4],
+          sppointss2: statsArray[5],
+          warcrimes: statsArray[6],
+          distance_walked: statsArray[7],
+          kills: statsArray[8],
+          ai_kills: statsArray[9],
+          shots: statsArray[10],
+          grenades_thrown: statsArray[11],
+          friendly_kills: statsArray[12],
+          friendly_ai_kills: statsArray[13],
+          deaths: statsArray[14],
+          distance_driven: statsArray[15],
+          points_as_driver_of_players: statsArray[16],
+          players_died_in_vehicle: statsArray[17],
+          roadkills: statsArray[18],
+          friendly_roadkills: statsArray[19],
+          ai_roadkills: statsArray[20],
+          friendly_ai_roadkills: statsArray[21],
+          distance_as_occupant: statsArray[22],
+          bandage_self: statsArray[23],
+          bandage_friendlies: statsArray[24],
+          tourniquet_self: statsArray[25],
+          tourniquet_friendlies: statsArray[26],
+          saline_self: statsArray[27],
+          saline_friendlies: statsArray[28],
+          morphine_self: statsArray[29],
+          morphine_friendlies: statsArray[30],
+          warcrime_harming_friendlies: statsArray[31],
+          crime_acceleration: statsArray[32],
+          kick_session_duration: statsArray[33],
+          kick_streak: statsArray[34],
+          lightban_session_duration: statsArray[35] || 0,
+          lightban_streak: statsArray[36] || 0,
+          heavyban_kick_session_duration: statsArray[37] || 0,
+          heavyban_streak: statsArray[38] || 0
+        };
+    }
+    return processedStats;
   }
 
   async logStats() {
     const playerStatsHash = await this.collectStats();
     if (!playerStatsHash || Object.keys(playerStatsHash).length === 0) {
-      logger.verbose(`[${this.name}] No player stats to log.`);
       return;
     }
 
@@ -249,212 +334,59 @@ class DBLogStats {
       .map(col => `${col} = VALUES(${col})`)
       .join(', ');
 
-    const BATCH_SIZE = 500;
+    const BATCH_SIZE = 100; 
     const playerEntries = Object.entries(playerStatsHash);
-    for (let i = 0; i < playerEntries.length; i += BATCH_SIZE) {
-      const batch = playerEntries.slice(i, i + BATCH_SIZE);
-      const values = [];
-      const placeholders = [];
-      for (const [playerUID, stats] of batch) {
-        placeholders.push(`(${Array(columns.length).fill('?').join(', ')})`);
-        values.push(
-          playerUID,
-          this.serverId || null,
-          stats.level || 0,
-          stats.level_experience || 0,
-          stats.session_duration || 0,
-          stats.sppointss0 || 0,
-          stats.sppointss1 || 0,
-          stats.sppointss2 || 0,
-          stats.warcrimes || 0,
-          stats.distance_walked || 0,
-          stats.kills || 0,
-          stats.ai_kills || 0,
-          stats.shots || 0,
-          stats.grenades_thrown || 0,
-          stats.friendly_kills || 0,
-          stats.friendly_ai_kills || 0,
-          stats.deaths || 0,
-          stats.distance_driven || 0,
-          stats.points_as_driver_of_players || 0,
-          stats.players_died_in_vehicle || 0,
-          stats.roadkills || 0,
-          stats.friendly_roadkills || 0,
-          stats.ai_roadkills || 0,
-          stats.friendly_ai_roadkills || 0,
-          stats.distance_as_occupant || 0,
-          stats.bandage_self || 0,
-          stats.bandage_friendlies || 0,
-          stats.tourniquet_self || 0,
-          stats.tourniquet_friendlies || 0,
-          stats.saline_self || 0,
-          stats.saline_friendlies || 0,
-          stats.morphine_self || 0,
-          stats.morphine_friendlies || 0,
-          stats.warcrime_harming_friendlies || 0,
-          stats.crime_acceleration || 0,
-          stats.kick_session_duration || 0,
-          stats.kick_streak || 0,
-          stats.lightban_session_duration || 0,
-          stats.lightban_streak || 0,
-          stats.heavyban_kick_session_duration || 0,
-          stats.heavyban_streak || 0
-        );
-      }
-      const query = `
-        INSERT INTO ${this.tableName} (${columns.join(', ')})
-        VALUES ${placeholders.join(', ')}
-        ON DUPLICATE KEY UPDATE ${updateStatements}
-      `;
-      const connection = await process.mysqlPool.getConnection();
-      const [result] = await connection.execute(query, values);
-      await connection.release();
-    }
-    return true;
-  }
-
-  async collectStats() {
-    logger.verbose(`[${this.name}] Initiating stats logging cycle.`);
-
-    const playerStatData = {};
-
+    
     try {
-      const files = await fs.readdir(this.folderPath);
-      const statFiles = files.filter(file => /^PlayerData\..+\.json$/.test(file));
-      if (statFiles.length === 0) {
-        logger.verbose(`[${this.name}] No player stat files found in folder.`);
-        return;
-      }
-
-      for (const file of statFiles) {
-        const match = /^PlayerData\.(.+)\.json$/.exec(file);
-        if (!match) continue;
-        const playerUID = match[1];
-        const filePath = pathModule.join(this.folderPath, file);
-        let fileContent;
-        try {
-          fileContent = await fs.readFile(filePath, "utf8");
-        } catch (readError) {
-          logger.warn(`[${this.name}] Failed to read file ${file}: ${readError.message}`);
-          continue;
+        const connection = await process.mysqlPool.getConnection();
+        
+        for (let i = 0; i < playerEntries.length; i += BATCH_SIZE) {
+          const batch = playerEntries.slice(i, i + BATCH_SIZE);
+          const values = [];
+          const placeholders = [];
+          
+          for (const [playerUID, stats] of batch) {
+            placeholders.push(`(${Array(columns.length).fill('?').join(', ')})`);
+            values.push(
+              playerUID,
+              this.serverId, // USE THE SERVER ID HERE
+              stats.level, stats.level_experience, stats.session_duration,
+              stats.sppointss0, stats.sppointss1, stats.sppointss2,
+              stats.warcrimes, stats.distance_walked, stats.kills, stats.ai_kills,
+              stats.shots, stats.grenades_thrown, stats.friendly_kills, stats.friendly_ai_kills,
+              stats.deaths, stats.distance_driven, stats.points_as_driver_of_players,
+              stats.players_died_in_vehicle, stats.roadkills, stats.friendly_roadkills,
+              stats.ai_roadkills, stats.friendly_ai_roadkills, stats.distance_as_occupant,
+              stats.bandage_self, stats.bandage_friendlies, stats.tourniquet_self,
+              stats.tourniquet_friendlies, stats.saline_self, stats.saline_friendlies,
+              stats.morphine_self, stats.morphine_friendlies, stats.warcrime_harming_friendlies,
+              stats.crime_acceleration, stats.kick_session_duration, stats.kick_streak,
+              stats.lightban_session_duration, stats.lightban_streak,
+              stats.heavyban_kick_session_duration, stats.heavyban_streak
+            );
+          }
+          
+          if (values.length > 0) {
+              const query = `
+                INSERT INTO ${this.tableName} (${columns.join(', ')})
+                VALUES ${placeholders.join(', ')}
+                ON DUPLICATE KEY UPDATE ${updateStatements}
+              `;
+              await connection.execute(query, values);
+          }
         }
-        let jsonData;
-        try {
-          jsonData = JSON.parse(fileContent);
-        } catch (parseError) {
-          logger.warn(`[${this.name}] Invalid JSON in file ${file}: ${parseError.message}`);
-          continue;
-        }
-        if (!jsonData.m_aStats || !Array.isArray(jsonData.m_aStats)) {
-          logger.warn(`[${this.name}] Missing or invalid 'm_aStats' in file ${file}.`);
-          continue;
-        }
-        const stats = jsonData.m_aStats;
-        if (stats.length < 35) {
-          logger.warn(`[${this.name}] Not enough stat entries in file ${file}. Expected at least 35, got ${stats.length}.`);
-          continue;
-        }
-        const trimmedStats = stats.slice(0, 39);
-        const [
-          level,
-          level_experience,
-          session_duration,
-          sppointss0,
-          sppointss1,
-          sppointss2,
-          warcrimes,
-          distance_walked,
-          kills,
-          ai_kills,
-          shots,
-          grenades_thrown,
-          friendly_kills,
-          friendly_ai_kills,
-          deaths,
-          distance_driven,
-          points_as_driver_of_players,
-          players_died_in_vehicle,
-          roadkills,
-          friendly_roadkills,
-          ai_roadkills,
-          friendly_ai_roadkills,
-          distance_as_occupant,
-          bandage_self,
-          bandage_friendlies,
-          tourniquet_self,
-          tourniquet_friendlies,
-          saline_self,
-          saline_friendlies,
-          morphine_self,
-          morphine_friendlies,
-          warcrime_harming_friendlies,
-          crime_acceleration,
-          kick_session_duration,
-          kick_streak,
-          lightban_session_duration,
-          lightban_streak,
-          heavyban_kick_session_duration,
-          heavyban_streak
-        ] = trimmedStats;
-
-        playerStatData[playerUID] = {
-          level,
-          level_experience,
-          session_duration,
-          sppointss0,
-          sppointss1,
-          sppointss2,
-          warcrimes,
-          distance_walked,
-          kills,
-          ai_kills,
-          shots,
-          grenades_thrown,
-          friendly_kills,
-          friendly_ai_kills,
-          deaths,
-          distance_driven,
-          points_as_driver_of_players,
-          players_died_in_vehicle,
-          roadkills,
-          friendly_roadkills,
-          ai_roadkills,
-          friendly_ai_roadkills,
-          distance_as_occupant,
-          bandage_self,
-          bandage_friendlies,
-          tourniquet_self,
-          tourniquet_friendlies,
-          saline_self,
-          saline_friendlies,
-          morphine_self,
-          morphine_friendlies,
-          warcrime_harming_friendlies,
-          crime_acceleration,
-          kick_session_duration,
-          kick_streak,
-          lightban_session_duration,
-          lightban_streak,
-          heavyban_kick_session_duration,
-          heavyban_streak
-        };
-      }
-    } catch (error) {
-      logger.error(`[${this.name}] Error during stats logging: ${error.message}`);
-      return;
+        connection.release();
+        logger.info(`[${this.name}] Successfully synced stats for ${playerEntries.length} players on Server ${this.serverId}.`);
+    } catch (err) {
+        logger.error(`[${this.name}] Database sync error: ${err.message}`);
     }
-
-    logger.verbose(`[${this.name}] Collected stats for ${Object.keys(playerStatData).length} players.`);
-    return playerStatData;
   }
 
   async cleanup() {
-    logger.verbose(`[${this.name}] Cleaning up...`);
     if (this.interval) {
       clearInterval(this.interval);
-      logger.verbose(`[${this.name}] Cleared logging interval.`);
+      this.interval = null;
     }
-    logger.info(`[${this.name}] Cleanup completed.`);
   }
 }
 
