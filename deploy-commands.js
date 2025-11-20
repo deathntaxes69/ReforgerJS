@@ -2,39 +2,44 @@ const { REST } = require('@discordjs/rest');
 const { Routes } = require('discord.js');
 const fs = require('fs');
 const path = require('path');
+const { ApplicationCommandOptionType } = require('discord-api-types/v10');
+
+// Helper to inject server choices recursively (handles subcommands)
+function injectServerChoices(options, serverChoices) {
+    if (!options) return;
+    for (const option of options) {
+        // If this option is named 'server' and is an Integer type
+        if (option.name === 'server' && option.type === ApplicationCommandOptionType.Integer) {
+            option.choices = serverChoices;
+        }
+        // Recursively check sub-options (for subcommands like /rcon restart)
+        if (option.options) {
+            injectServerChoices(option.options, serverChoices);
+        }
+    }
+}
 
 async function deployCommands(config, logger, discordClient = null) {
     if (!config || !logger) {
-        console.error('Missing required parameters: config and logger must be provided');
+        console.error('Missing required parameters: config and logger');
         return false;
     }
 
     try {
-        if (!config.connectors || !config.connectors.discord) {
-            logger.error('Discord connector configuration is missing in the config.');
-            return false;
-        }
-        
         const discordConfig = config.connectors.discord;
-        if (!discordConfig.token || !discordConfig.clientId || !discordConfig.guildId) {
-            logger.error('Discord token, clientId, or guildId is missing in the config.');
+        if (!discordConfig?.token || !discordConfig?.clientId || !discordConfig?.guildId) {
+            logger.error('Discord configuration missing.');
             return false;
         }
-        
-        if (!config.commands || !Array.isArray(config.commands)) {
-            logger.error('Commands configuration is missing or not an array in the config.');
-            return false;
-        }
+
+        // Build the list of server choices from config
+        // Discord limits choices to 25 max.
+        const serverChoices = config.servers.slice(0, 25).map(s => ({
+            name: `${s.name} (ID: ${s.id})`.substring(0, 100), // Discord name limit
+            value: s.id
+        }));
 
         const rest = new REST({ version: '10' }).setToken(discordConfig.token);
-
-        logger.info('Clearing existing commands...');
-        await rest.put(
-            Routes.applicationGuildCommands(discordConfig.clientId, discordConfig.guildId),
-            { body: [] }
-        );
-        logger.info('Successfully cleared existing commands.');
-
         const commandsPath = path.resolve(process.cwd(), './reforger-server/commands');
         const commandFiles = fs.readdirSync(commandsPath).filter(file => file.endsWith('.js'));
         const commands = [];
@@ -42,60 +47,58 @@ async function deployCommands(config, logger, discordClient = null) {
         for (const file of commandFiles) {
             const command = require(path.join(commandsPath, file));
             const commandConfig = config.commands.find(cmd => cmd.command === command.data.name);
+            
             if (commandConfig && commandConfig.enabled) {
-                commands.push(command.data.toJSON());
-                logger.info(`Command '/${command.data.name}' loaded.`);
-            } else {
-                logger.info(`Command '/${command.data.name}' is disabled in the config and will not be loaded.`);
+                // Convert to JSON first so we can modify the structure directly
+                const commandData = command.data.toJSON();
+                
+                // Inject our dynamic server list
+                if (serverChoices.length > 0) {
+                    injectServerChoices(commandData.options, serverChoices);
+                }
+
+                commands.push(commandData);
+                logger.info(`Command '/${command.data.name}' loaded with ${serverChoices.length} server choices.`);
             }
         }
 
         if (commands.length > 0) {
-            logger.info('Deploying commands...');
+            logger.info('Deploying commands to Discord...');
             await rest.put(
                 Routes.applicationGuildCommands(discordConfig.clientId, discordConfig.guildId),
                 { body: commands }
             );
-            logger.info(`Successfully deployed ${commands.length} commands.`);
-            
-            if (discordClient) {
-                logger.verbose('Refreshing Discord client command cache...');
-                await discordClient.application.commands.fetch();
-                logger.verbose('Discord command cache refreshed.');
-            }
+            logger.info(`Successfully registered ${commands.length} slash commands.`);
+            return true;
         } else {
-            logger.warn('No commands to deploy. All commands are disabled in config.');
+            logger.warn('No commands enabled to deploy.');
+            return false;
         }
         
-        return true;
     } catch (error) {
         logger.error(`Error deploying commands: ${error.message}`);
-        logger.debug(error.stack);
         return false;
     }
 }
 
-// When run directly as a script, used for backward compatibility of older versions
+// Allow running directly
 if (require.main === module) {
-    const logger = require('./reforger-server/logger/logger');
+    // Mock logger for standalone run
+    const logger = { 
+        info: console.log, 
+        error: console.error, 
+        warn: console.warn, 
+        verbose: () => {} 
+    };
     
     (async () => {
-        const configPath = path.resolve(__dirname, './config.json');
-        let config;
-        
         try {
-            const rawData = fs.readFileSync(configPath, 'utf8');
-            if (!rawData) {
-                throw new Error('Config file is empty.');
-            }
-            config = JSON.parse(rawData);
+            const configPath = path.resolve(__dirname, './config.json');
+            const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+            await deployCommands(config, logger);
         } catch (error) {
-            logger.error(`Error reading config file: ${error.message}`);
-            process.exit(1);
+            console.error('Standalone deployment failed:', error);
         }
-        
-        await deployCommands(config, logger);
-        process.exit(0);
     })();
 } else {
     module.exports = deployCommands;
