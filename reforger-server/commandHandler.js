@@ -1,4 +1,3 @@
-// reforger-server/commandHandler.js
 const fs = require('fs');
 const path = require('path');
 
@@ -25,7 +24,6 @@ class CommandHandler {
     
         if (!commandConfig || !commandConfig.enabled) {
             logger.info(`Command '${commandName}' is disabled in this instance. Ignoring.`);
-            // Reply to the user so the command doesn't time out
             if (!interaction.deferred && !interaction.replied) {
                 await interaction.reply({
                     content: `This command (/ ${commandName}) is disabled in the bot's configuration.`,
@@ -58,7 +56,7 @@ class CommandHandler {
             await commandFunction(interaction, this.serverInstances, this.discordClient, extraData);
         } catch (error) {
             logger.error(`Error executing command '${commandName}': ${error.message}`);
-            logger.error(error.stack); // Log the stack for more detail
+            logger.error(error.stack);
             if (!interaction.replied && !interaction.deferred) {
                 await interaction.reply({
                     content: 'An error occurred while executing the command.',
@@ -77,28 +75,8 @@ class CommandHandler {
         const allowedRoles = [];
 
         for (const [key, roles] of Object.entries(roleLevels)) {
-            // Ensure level is treated as a number
-            const numericLevel = parseInt(key, 10);
-            
-            // User's level must be less than or equal to the command's level.
-            // (e.g., Level 1 user can use Level 1, 2, 3 commands)
-            // Or is it the other way? (Level 1 is highest perm)
-            // The README says: "Level 1 has full access... Level 3 can only access level 3 or lower"
-            // This implies a lower number is a HIGHER privilege.
-            // So, a user's level (e.g., 1) must be <= the command's level (e.g., 3).
-            
-            // Let's re-read the roles: "Level 1 has full access... Level 3 can only access level 3 or lower commands"
-            // This is confusingly worded. Let's assume lower number = higher privilege.
-            // A level 1 user should be able to run a level 3 command.
-            // A level 3 user should NOT be able to run a level 1 command.
-            // Therefore, the check should be: if (user's_permission_level <= command_required_level)
-            // We need to find the user's BEST level.
-            
-            // Let's re-implement this check based on how it's used.
-            // The commandHandler checks if a user's roles are in the list for that level or HIGHER.
-            // Example: Command needs level 3.
-            // We check roles for level 1, 2, and 3.
-            
+            // Logic: lower number = higher privilege.
+            // If command level is 3, users with level 1, 2, and 3 can use it.
             if (parseInt(key, 10) <= level) {
                 roles.forEach(role => {
                     if (this.config.roles[role]) {
